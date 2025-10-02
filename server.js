@@ -1,329 +1,190 @@
-// GMN LAN Multiplayer Signaling Server
-// Author: Gemini (Updated)
-// Version: 1.3.0
-//
-// This is a lightweight WebSocket server for establishing WebRTC connections
-// between RPG Maker MZ clients on a local network.
-//
-// CHANGES v1.3.0:
-// - Added persistent "PLZA" room for a shared world experience.
-// - Plaza state (switches, variables) is server-authoritative.
-// - Plaza state is saved to `plaza_state.json` and persists through restarts.
-// - Plaza state is automatically reset every week.
-// - Updated message handling for Plaza-specific state synchronization.
-//
-// CHANGES v1.2.0:
-// - Increased maximum players per room from 3 to 8
-// - Improved player ID assignment logic for larger rooms
-//
-// HOW TO RUN:
-// 1. Make sure you have Node.js installed (https://nodejs.org/).
-// 2. Open a terminal or command prompt.
-// 3. Navigate to the directory where this file is saved.
-// 4. Run the command: node signaling_server.js
+//=============================================================================
+// RPG Maker MZ Multiplayer Server for Centralized Architecture
+// Version: 1.0.0
+//=============================================================================
 
 const WebSocket = require('ws');
-const fs = require('fs');
 
-const wss = new WebSocket.Server({ port: 8080 });
+// Use the PORT environment variable provided by Render.com, or 8080 for local testing.
+const PORT = process.env.PORT || 8080;
 
-const rooms = new Map();
-const MAX_PLAYERS_PER_ROOM = 8;
-const PLAZA_ROOM_ID = "PLZA";
-const PLAZA_STATE_FILE = './plaza_state.json';
+const wss = new WebSocket.Server({ port: PORT });
 
-// --- PLAZA STATE MANAGEMENT ---
-let plazaState = {
+console.log(`Starting server on port ${PORT}...`);
+
+// --- Server State ---
+let nextPlayerId = 1;
+// Use a Map to store player data, keyed by their unique ID.
+// players: { playerId -> { ws: WebSocket, info: Object } }
+const players = new Map();
+
+// The server's authoritative game state. This will be sent to new players.
+const gameState = {
     switches: {},
     variables: {},
-    lastReset: new Date().toISOString()
+    selfSwitches: {}
 };
 
-// Load persistent Plaza state on startup
-try {
-    if (fs.existsSync(PLAZA_STATE_FILE)) {
-        const savedState = JSON.parse(fs.readFileSync(PLAZA_STATE_FILE, 'utf-8'));
-        if (savedState.switches && savedState.variables && savedState.lastReset) {
-            plazaState = savedState;
-            console.log('Loaded persistent Plaza state from file.');
-        }
-    }
-} catch (e) {
-    console.error('Could not load plaza_state.json:', e);
-}
+// --- Helper Functions ---
 
-function savePlazaState() {
-    try {
-        fs.writeFileSync(PLAZA_STATE_FILE, JSON.stringify(plazaState, null, 2));
-    } catch (e) {
-        console.error('Failed to save Plaza state:', e);
+/**
+ * Broadcasts a message to all connected clients except the originator.
+ * @param {object} data The data object to send.
+ * @param {number} [originatorId] The ID of the player who sent the message.
+ */
+function broadcast(data, originatorId = null) {
+    const message = JSON.stringify(data);
+    for (const [playerId, player] of players.entries()) {
+        if (playerId !== originatorId && player.ws.readyState === WebSocket.OPEN) {
+            player.ws.send(message);
+        }
     }
 }
 
-// Check for weekly reset every hour
-setInterval(() => {
-    const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-    const lastResetTime = new Date(plazaState.lastReset).getTime();
-    if (Date.now() - lastResetTime > ONE_WEEK_MS) {
-        console.log('Performing weekly reset of Plaza state.');
-        plazaState.switches = {};
-        plazaState.variables = {};
-        plazaState.lastReset = new Date().toISOString();
-        savePlazaState();
 
-        const plazaRoom = rooms.get(PLAZA_ROOM_ID);
-        if (plazaRoom) {
-            broadcastToRoom(PLAZA_ROOM_ID, {
-                type: 'plaza-state-reset',
-                message: 'The world state has been reset for the week.'
-            });
-        }
-    }
-}, 60 * 60 * 1000);
-
-// --- SERVER START ---
-console.log('Signaling server started on port 8080...');
-console.log(`Maximum players per room: ${MAX_PLAYERS_PER_ROOM}`);
-// Initialize the persistent Plaza room
-rooms.set(PLAZA_ROOM_ID, new Map());
-console.log(`Persistent Plaza room "${PLAZA_ROOM_ID}" is active.`);
-console.log('Waiting for players to connect...');
-
+// --- Main Server Logic ---
 
 wss.on('connection', (ws) => {
-    console.log('Client connected.');
+    // Assign a unique ID to the new player.
+    const playerId = nextPlayerId++;
+    ws.playerId = playerId; // Attach the ID to the WebSocket object for easy reference.
 
-    ws.on('message', (message) => {
-        let data;
+    console.log(`Player ${playerId} connected.`);
+
+    // Keep-alive mechanism: Render's free tier can idle. Pinging keeps the connection active.
+    ws.isAlive = true;
+    ws.on('pong', () => {
+        ws.isAlive = true;
+    });
+
+    // Handle incoming messages from this client
+    ws.on('message', (rawMessage) => {
         try {
-            data = JSON.parse(message);
-        } catch (e) {
-            console.error('Invalid JSON received:', message);
-            return;
-        }
+            const data = JSON.parse(rawMessage);
 
-        switch (data.type) {
-            case 'create':
-                handleCreateRoom(ws, data.roomId);
-                break;
-            case 'join':
-                handleJoinRoom(ws, data.roomId, data.playerInfo);
-                break;
-            case 'list-rooms':
-                handleListRooms(ws);
-                break;
-            // Plaza-specific state updates
-            case 'plaza-switch-change':
-                handlePlazaSwitchChange(ws, data.id, data.value);
-                break;
-            case 'plaza-variable-change':
-                handlePlazaVariableChange(ws, data.id, data.value);
-                break;
-            // WebRTC signaling forwarding
-            case 'webrtc-offer':
-            case 'webrtc-answer':
-            case 'webrtc-candidate':
-                forwardMessage(ws, data);
-                break;
-            default:
-                console.log('Unknown message type:', data.type);
+            // The first message must be 'login'
+            if (data.type === 'login') {
+                // Store the player's data
+                players.set(playerId, { ws: ws, info: data.playerInfo });
+
+                // Get a list of all other players to send to the new player
+                const otherPlayers = [];
+                for (const [id, p] of players.entries()) {
+                    if (id !== playerId) {
+                        otherPlayers.push({ id: id, info: p.info });
+                    }
+                }
+
+                // Send a success message back to the newly connected player
+                ws.send(JSON.stringify({
+                    type: 'login-success',
+                    yourId: playerId,
+                    gameState: gameState,
+                    players: otherPlayers
+                }));
+
+                // Notify all other players that a new player has joined
+                broadcast({
+                    type: 'player-joined',
+                    playerId: playerId,
+                    playerInfo: data.playerInfo
+                }, playerId);
+
+                return; // Stop processing after login
+            }
+            
+            // For all other message types, ensure the player is logged in
+            if (!players.has(ws.playerId)) {
+                console.warn(`Message received from non-logged-in client. Disconnecting.`);
+                ws.terminate();
+                return;
+            }
+
+            // Process different message types
+            switch (data.type) {
+                case 'player-move':
+                case 'player-meta':
+                case 'map-transfer':
+                case 'player-state-change':
+                    // Update server state with new player info/location
+                    const player = players.get(ws.playerId);
+                    if (player) {
+                        if (data.type === 'player-move') {
+                            player.info.x = data.x;
+                            player.info.y = data.y;
+                            player.info.direction = data.direction;
+                        } else if (data.type === 'map-transfer') {
+                            player.info.mapId = data.mapId;
+                        } else if (data.type === 'player-meta') {
+                            player.info = data.info;
+                        }
+                    }
+                    // Relay the message to all other clients
+                    broadcast({ ...data, from: ws.playerId }, ws.playerId);
+                    break;
+
+                case 'switch-change':
+                    if (data.id !== undefined && data.value !== undefined) {
+                        gameState.switches[data.id] = data.value;
+                        broadcast({ ...data, from: ws.playerId }, ws.playerId);
+                    }
+                    break;
+
+                case 'variable-change':
+                    if (data.id !== undefined && data.value !== undefined) {
+                        gameState.variables[data.id] = data.value;
+                        broadcast({ ...data, from: ws.playerId }, ws.playerId);
+                    }
+                    break;
+
+                case 'self-switch-change':
+                    const key = `${data.mapId},${data.eventId},${data.switchType}`;
+                    gameState.selfSwitches[key] = data.value;
+                    broadcast({ ...data, from: ws.playerId }, ws.playerId);
+                    break;
+
+                default:
+                    console.log(`Received unknown message type: ${data.type}`);
+                    break;
+            }
+        } catch (error) {
+            console.error(`Failed to process message: ${rawMessage}`, error);
         }
     });
 
+    // Handle client disconnection
     ws.on('close', () => {
-        console.log('Client disconnected.');
-        handleDisconnect(ws);
+        const disconnectedId = ws.playerId;
+        if (players.has(disconnectedId)) {
+            players.delete(disconnectedId);
+            console.log(`Player ${disconnectedId} disconnected.`);
+            // Notify all remaining players
+            broadcast({
+                type: 'player-left',
+                playerId: disconnectedId
+            });
+        }
     });
 
     ws.on('error', (error) => {
-        console.error('WebSocket error:', error);
+        console.error(`WebSocket error for player ${ws.playerId}:`, error);
     });
 });
 
-function handleCreateRoom(ws, roomId) {
-    if (rooms.has(roomId) || roomId === PLAZA_ROOM_ID) {
-        sendMessage(ws, { type: 'error', message: 'Room already exists.' });
-        return;
-    }
-
-    const players = new Map();
-    const playerId = 1; // The creator is always Player 1
-    players.set(playerId, ws);
-
-    ws.meta = { roomId, playerId };
-    rooms.set(roomId, players);
-
-    console.log(`Room "${roomId}" created by Player ${playerId}.`);
-    sendMessage(ws, { type: 'room-created', roomId });
-}
-
-function handleJoinRoom(ws, roomId, playerInfo) {
-    if (roomId === PLAZA_ROOM_ID) {
-        handleJoinPlaza(ws, playerInfo);
-        return;
-    }
-
-    const room = rooms.get(roomId);
-    if (!room) {
-        sendMessage(ws, { type: 'error', message: 'Room not found.' });
-        return;
-    }
-
-    if (room.size >= MAX_PLAYERS_PER_ROOM) {
-        sendMessage(ws, { type: 'error', message: 'Room is full.' });
-        return;
-    }
-
-    const newPlayerId = findNextAvailablePlayerId(room);
-    if (!newPlayerId) {
-        sendMessage(ws, { type: 'error', message: 'No available player slots.' });
-        return;
-    }
-
-    ws.meta = { roomId, playerId: newPlayerId, playerInfo };
-
-    const otherPlayers = [];
-    for (const [id, client] of room.entries()) {
-        otherPlayers.push({ id, info: client.meta.playerInfo });
-        sendMessage(client, { type: 'player-joined', playerId: newPlayerId, playerInfo });
-    }
-    
-    room.set(newPlayerId, ws);
-
-    console.log(`Player ${newPlayerId} joined room "${roomId}" (${room.size}/${MAX_PLAYERS_PER_ROOM} players).`);
-    sendMessage(ws, { type: 'room-joined', roomId, yourId: newPlayerId, otherPlayers });
-}
-
-function handleJoinPlaza(ws, playerInfo) {
-    const plazaRoom = rooms.get(PLAZA_ROOM_ID);
-    const newPlayerId = findNextAvailablePlayerId(plazaRoom, 100); // Allow up to 100 players in Plaza
-
-    ws.meta = { roomId: PLAZA_ROOM_ID, playerId: newPlayerId, playerInfo };
-
-    const otherPlayers = [];
-    for (const [id, client] of plazaRoom.entries()) {
-        if (client.meta && client.meta.playerInfo) {
-            otherPlayers.push({ id, info: client.meta.playerInfo });
+// Interval to check for inactive connections and terminate them
+const interval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (!ws.isAlive) {
+            console.log(`Terminating inactive connection for player ${ws.playerId || '(unknown)'}.`);
+            return ws.terminate();
         }
-        sendMessage(client, { type: 'player-joined', playerId: newPlayerId, playerInfo });
-    }
-
-    plazaRoom.set(newPlayerId, ws);
-    console.log(`Player ${newPlayerId} joined Plaza "${PLAZA_ROOM_ID}" (${plazaRoom.size} players).`);
-    
-    // Notify the new player they've joined the Plaza and send other players' info
-    sendMessage(ws, {
-        type: 'room-joined',
-        roomId: PLAZA_ROOM_ID,
-        isPlaza: true,
-        yourId: newPlayerId,
-        otherPlayers
+        ws.isAlive = false;
+        ws.ping(() => {});
     });
+}, 30000); // 30 seconds
 
-    // Send the entire current Plaza state to the new player
-    sendMessage(ws, {
-        type: 'plaza-full-state',
-        switches: plazaState.switches,
-        variables: plazaState.variables
-    });
-}
+wss.on('close', () => {
+    clearInterval(interval);
+});
 
-function findNextAvailablePlayerId(room, limit = MAX_PLAYERS_PER_ROOM) {
-    // Player 1 is reserved for leaders in standard rooms
-    const startId = (room === rooms.get(PLAZA_ROOM_ID)) ? 1 : 2;
-    for (let id = startId; id <= limit; id++) {
-        if (!room.has(id)) {
-            return id;
-        }
-    }
-    return null; // No available slots
-}
-
-function handleListRooms(ws) {
-    const roomList = Array.from(rooms.entries())
-        .filter(([roomId]) => roomId !== PLAZA_ROOM_ID) // Don't list the Plaza
-        .map(([roomId, players]) => ({
-            id: roomId,
-            players: players.size,
-            maxPlayers: MAX_PLAYERS_PER_ROOM,
-            isFull: players.size >= MAX_PLAYERS_PER_ROOM
-        }));
-    
-    console.log(`Sending room list to client: ${roomList.length} rooms available`);
-    sendMessage(ws, {
-        type: 'room-list',
-        rooms: roomList
-    });
-}
-
-function handleDisconnect(ws) {
-    if (!ws.meta) return;
-
-    const { roomId, playerId } = ws.meta;
-    const room = rooms.get(roomId);
-
-    if (room) {
-        room.delete(playerId);
-        console.log(`Player ${playerId} left room "${roomId}" (${room.size} players remaining).`);
-
-        // If room is not the Plaza and becomes empty or leader leaves, close it
-        if (roomId !== PLAZA_ROOM_ID && (playerId === 1 || room.size === 0)) {
-            console.log(`Closing room "${roomId}".`);
-            for (const client of room.values()) {
-                sendMessage(client, {type: 'error', message: 'The room has been closed by the leader.'});
-                client.close();
-            }
-            rooms.delete(roomId);
-        } else {
-            // Notify remaining players that this player has left
-            broadcastToRoom(roomId, { type: 'player-left', playerId });
-        }
-    }
-}
-
-function forwardMessage(ws, data) {
-    if (!ws.meta) return;
-    const { roomId, playerId } = ws.meta;
-    const room = rooms.get(roomId);
-
-    if (room && data.to) {
-        const recipient = room.get(data.to);
-        if (recipient) {
-            data.from = playerId;
-            sendMessage(recipient, data);
-        } else {
-            console.log(`Could not find recipient ${data.to} in room ${roomId}`);
-        }
-    }
-}
-
-function handlePlazaSwitchChange(ws, switchId, value) {
-    if (ws.meta.roomId !== PLAZA_ROOM_ID) return;
-    plazaState.switches[switchId] = value;
-    savePlazaState();
-    broadcastToRoom(PLAZA_ROOM_ID, { type: 'plaza-sync-switch', id: switchId, value }, ws);
-}
-
-function handlePlazaVariableChange(ws, variableId, value) {
-    if (ws.meta.roomId !== PLAZA_ROOM_ID) return;
-    plazaState.variables[variableId] = value;
-    savePlazaState();
-    broadcastToRoom(PLAZA_ROOM_ID, { type: 'plaza-sync-variable', id: variableId, value }, ws);
-}
-
-function broadcastToRoom(roomId, data, excludeWs = null) {
-    const room = rooms.get(roomId);
-    if (room) {
-        for (const client of room.values()) {
-            if (client !== excludeWs) {
-                sendMessage(client, data);
-            }
-        }
-    }
-}
-
-function sendMessage(ws, data) {
-    if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(data));
-    }
-}
+console.log('Server is running and waiting for connections.');
